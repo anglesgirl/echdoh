@@ -29,7 +29,7 @@ jobs:
       - name: Bind echdoh.aar
         run: |
           go mod tidy
-          gomobile bind -javapkg com.anglesgirl.echdoh -target=android -androidapi 27 -o echdoh.aar ./echdoh
+          gomobile bind -javapkg com.anglesgirl.echdoh -target=android -androidapi 26 -o echdoh.aar ./echdoh
 
       - name: Upload AAR
         uses: actions/upload-artifact@v4
