@@ -32,8 +32,13 @@ func StartScanCFIPs(count int) {
 	go func() {
 		ips := loadScanCache()
 		if len(ips) == 0 {
+			// 本地缓存空 → 试云端扫描池（跨设备共享，2026-08-16）
+			ips = cloudPullScan()
+		}
+		if len(ips) == 0 {
 			ips = scanReachableCFIPs(count, 3*time.Second)
 			saveScanCache(ips)
+			cloudPushScan(ips) // 云端共享扫描池
 		}
 		reachableMu.Lock()
 		reachableIPs = ips

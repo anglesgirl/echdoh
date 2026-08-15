@@ -142,6 +142,12 @@ func Start(listen string, certPEM, keyPEM, upstreams string) error {
 	// 后台扫描 CF IP 段找可达边缘（进轮换池，解决单一 IP 抖动）
 	StartScanCFIPs(64)
 
+	// 云缓存：启动拉一次云端探测结果合并（SetCloudCache 启用时）
+	go func() {
+		time.Sleep(2 * time.Second) // 等本地缓存加载完
+		cloudPull()
+	}()
+
 	// 云配置：从 doh.anglesgirl.eu.org TXT 拉取 overrides/force/pool
 	// （2026-08-15 用户要求：改 IP 改 DNS 记录即可，零出包）
 	StartCloudConfig()
@@ -670,8 +676,10 @@ func echHandshakeOK(ip, host string, timeout time.Duration) bool {
 	echTestCache[cacheKey] = echTestEntry{ok: ok, ts: time.Now()}
 	// 2026-08-16：写后即落盘（原只在 pool 分支 Save → 官方段探测结果
 	// 丢了，下次启动重探）。限频：最多 1s 一次，避免高频探测刷盘。
+	entry := echTestCache[cacheKey]
 	echTestMu.Unlock()
 	saveEchTestCacheThrottled()
+	cloudNote(cacheKey, entry) // 云缓存增量（20s 批量推送）
 	slog("%s %s: ECH probe -> %v", host, ip, ok)
 	return ok
 }
