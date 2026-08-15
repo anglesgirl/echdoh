@@ -4,8 +4,10 @@
 package echdoh
 
 import (
+	"encoding/json"
 	"math/rand"
 	"net"
+	"os"
 	"sync"
 	"time"
 )
@@ -24,14 +26,62 @@ var cfCIDRs = []string{
 
 // StartScanCFIPs 后台扫描 CF IP 段，找 TCP 443 可达的 IP 进轮换池。
 // 在 Start 内自动调用；App 启动即扫，完成后查询自动用新池。
+// 2026-08-16 优化：结果落盘缓存 24h（scan-cache.json）—— 冷启动
+// 不再每次扫 64 个 IP（~3s），有缓存直接用。
 func StartScanCFIPs(count int) {
 	go func() {
-		ips := scanReachableCFIPs(count, 3*time.Second)
+		ips := loadScanCache()
+		if len(ips) == 0 {
+			ips = scanReachableCFIPs(count, 3*time.Second)
+			saveScanCache(ips)
+		}
 		reachableMu.Lock()
 		reachableIPs = ips
 		reachableMu.Unlock()
-		slog("CF IP scan: %d reachable candidates (of %d)", len(ips), count)
+		slog("CF IP scan: %d reachable candidates (of %d)%s", len(ips), count,
+			func() string {
+				if len(loadScanCache()) > 0 {
+					return " [cached]"
+				}
+				return ""
+			}())
 	}()
+}
+
+var scanCachePath string
+
+func SetScanCachePath(p string) { scanCachePath = p }
+
+func loadScanCache() []string {
+	if scanCachePath == "" {
+		return nil
+	}
+	b, err := os.ReadFile(scanCachePath)
+	if err != nil {
+		return nil
+	}
+	var st struct {
+		Ts  int64    `json:"ts"`
+		IPs []string `json:"ips"`
+	}
+	if json.Unmarshal(b, &st) != nil || len(st.IPs) == 0 {
+		return nil
+	}
+	if time.Since(time.Unix(st.Ts, 0)) > 24*time.Hour {
+		return nil
+	}
+	return st.IPs
+}
+
+func saveScanCache(ips []string) {
+	if scanCachePath == "" || len(ips) == 0 {
+		return
+	}
+	b, _ := json.Marshal(struct {
+		Ts  int64    `json:"ts"`
+		IPs []string `json:"ips"`
+	}{time.Now().Unix(), ips})
+	os.WriteFile(scanCachePath, b, 0o644)
 }
 
 // scanReachableCFIPs 随机生成 count 个 CF IP，并发 TCP 443 连通性测试。

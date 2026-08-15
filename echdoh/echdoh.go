@@ -668,9 +668,28 @@ func echHandshakeOK(ip, host string, timeout time.Duration) bool {
 	}()
 	echTestMu.Lock()
 	echTestCache[cacheKey] = echTestEntry{ok: ok, ts: time.Now()}
+	// 2026-08-16：写后即落盘（原只在 pool 分支 Save → 官方段探测结果
+	// 丢了，下次启动重探）。限频：最多 1s 一次，避免高频探测刷盘。
 	echTestMu.Unlock()
+	saveEchTestCacheThrottled()
 	slog("%s %s: ECH probe -> %v", host, ip, ok)
 	return ok
+}
+
+// saveEchTestCacheThrottled 限频落盘（1s 内最多一次）。
+var (
+	saveThrottleMu sync.Mutex
+	lastSaveTs     time.Time
+)
+
+func saveEchTestCacheThrottled() {
+	saveThrottleMu.Lock()
+	defer saveThrottleMu.Unlock()
+	if time.Since(lastSaveTs) < time.Second {
+		return
+	}
+	lastSaveTs = time.Now()
+	SaveEchTestCache()
 }
 
 // officialSubnetIPs 从官方解析 CF IP 生成候选，全部经过 ECH 握手探测：
@@ -1323,7 +1342,22 @@ func fetchDohEndpointIPv4s() []string {
 }
 
 // fetchCFPublicECH 获取 Cloudflare 公共 ECH 公钥（cloudflare-ech.com HTTPS ech=）。
+// echKeyMu/echKeyCache: CF 公共 ECH 配置缓存（2026-08-16 优化：
+// 原每次调用都查上游 DoH —— 每个域名探测/响应各拉一次，浪费。
+// cloudflare-ech.com 的配置长期不变，缓存 10min 足够）。
+var (
+	echKeyMu    sync.Mutex
+	echKeyCache []byte
+	echKeyTs    time.Time
+)
+
 func fetchCFPublicECH() []byte {
+	echKeyMu.Lock()
+	if len(echKeyCache) > 0 && time.Since(echKeyTs) < 10*time.Minute {
+		echKeyMu.Unlock()
+		return echKeyCache
+	}
+	echKeyMu.Unlock()
 	q := new(dns.Msg)
 	q.SetQuestion("cloudflare-ech.com.", dns.TypeHTTPS)
 	resp, err := queryUpstream(q)
@@ -1331,14 +1365,21 @@ func fetchCFPublicECH() []byte {
 		slog("fetchCFPublicECH upstream error: %v", err)
 		return nil
 	}
+	var ech []byte
 	for _, rr := range resp.Answer {
 		for _, kv := range svcbValues(rr) {
-			if ech, ok := kv.(*dns.SVCBECHConfig); ok {
-				return ech.ECH
+			if e, ok := kv.(*dns.SVCBECHConfig); ok {
+				ech = e.ECH
 			}
 		}
 	}
-	return nil
+	if len(ech) > 0 {
+		echKeyMu.Lock()
+		echKeyCache = ech
+		echKeyTs = time.Now()
+		echKeyMu.Unlock()
+	}
+	return ech
 }
 
 func summarizeECH(resp *dns.Msg) string {
