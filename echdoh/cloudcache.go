@@ -20,6 +20,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -99,10 +100,8 @@ func cloudPull() {
 	ccMu.Unlock()
 
 	resp, err := tursoPipeline(baseURL, token, []map[string]any{
-		{
-			"stmt": "SELECT k, ok, ts FROM ech_probe WHERE ts > :minTs",
-			"args": map[string]any{"minTs": time.Now().Add(-25 * time.Hour).Unix()},
-		},
+		tursoExec("SELECT k, ok, ts FROM ech_probe WHERE ts > ?",
+			time.Now().Add(-25*time.Hour).Unix()),
 	})
 	if err != nil {
 		slog("cloud pull failed: %v", err)
@@ -153,14 +152,12 @@ func cloudPushScan(ips []string) {
 	baseURL, token := cloudBaseURL, cloudToken
 	ccMu.Unlock()
 	now := time.Now().Unix()
-	stmts := make([]map[string]any, 0, len(ips))
+	reqs := make([]map[string]any, 0, len(ips))
 	for _, ip := range ips {
-		stmts = append(stmts, map[string]any{
-			"stmt": "INSERT OR REPLACE INTO ech_scan (k, ts) VALUES (:k, :ts)",
-			"args": map[string]any{"k": ip, "ts": now},
-		})
+		reqs = append(reqs, tursoExec(
+			"INSERT OR REPLACE INTO ech_scan (k, ts) VALUES (?, ?)", ip, now))
 	}
-	if _, err := tursoPipeline(baseURL, token, stmts); err != nil {
+	if _, err := tursoPipeline(baseURL, token, reqs); err != nil {
 		slog("cloud scan push failed: %v", err)
 	}
 }
@@ -174,10 +171,8 @@ func cloudPullScan() []string {
 	baseURL, token := cloudBaseURL, cloudToken
 	ccMu.Unlock()
 	resp, err := tursoPipeline(baseURL, token, []map[string]any{
-		{
-			"stmt": "SELECT k FROM ech_scan WHERE ts > :minTs",
-			"args": map[string]any{"minTs": time.Now().Add(-24 * time.Hour).Unix()},
-		},
+		tursoExec("SELECT k FROM ech_scan WHERE ts > ?",
+			time.Now().Add(-24*time.Hour).Unix()),
 	})
 	if err != nil {
 		return nil
@@ -193,9 +188,10 @@ func cloudPullScan() []string {
 	return ips
 }
 
-// tursoPipeline 调用 Turso v2 pipeline API（复用 LabelScanner 验证过的格式）。
-func tursoPipeline(baseURL, token string, stmts []map[string]any) (map[string]any, error) {
-	body, _ := json.Marshal(map[string]any{"statements": stmts})
+// tursoPipeline 调用 Turso v2 pipeline API（LabelScanner 验证过的格式：
+// {"requests":[{"type":"execute","stmt":{"sql":"...","args":[{type,value}]}}]}）。
+func tursoPipeline(baseURL, token string, reqs []map[string]any) (map[string]any, error) {
+	body, _ := json.Marshal(map[string]any{"requests": reqs})
 	u := strings.TrimSuffix(baseURL, "/")
 	if !strings.HasSuffix(u, "/v2/pipeline") {
 		u += "/v2/pipeline"
@@ -222,18 +218,54 @@ func tursoPipeline(baseURL, token string, stmts []map[string]any) (map[string]an
 	return out, nil
 }
 
-// pipelineRows 提取 pipeline 响应的第 idx 个 statement 的 rows。
+// tursoExec 构造一条 execute 请求（? 位置占位符）。
+// 注意：Turso pipeline 的 value 一律是字符串（整数也要 "1"）。
+func tursoExec(sql string, args ...any) map[string]any {
+	argList := make([]any, 0, len(args))
+	for _, a := range args {
+		switch v := a.(type) {
+		case string:
+			argList = append(argList, map[string]any{"type": "text", "value": v})
+		case int:
+			argList = append(argList, map[string]any{"type": "integer", "value": strconv.Itoa(v)})
+		case int64:
+			argList = append(argList, map[string]any{"type": "integer", "value": strconv.FormatInt(v, 10)})
+		default:
+			argList = append(argList, map[string]any{"type": "text", "value": fmt.Sprint(v)})
+		}
+	}
+	return map[string]any{
+		"type": "execute",
+		"stmt": map[string]any{"sql": sql, "args": argList},
+	}
+}
+
+// pipelineRows 提取 pipeline 响应第 idx 个请求的 rows
+// （results[i].response.result.rows，cell 解包为裸值）。
 func pipelineRows(resp map[string]any, idx int) [][]any {
 	results, _ := resp["results"].([]any)
 	if idx >= len(results) {
 		return nil
 	}
 	r, _ := results[idx].(map[string]any)
-	rows, _ := r["rows"].([]any)
+	response, _ := r["response"].(map[string]any)
+	result, _ := response["result"].(map[string]any)
+	rows, _ := result["rows"].([]any)
 	out := make([][]any, 0, len(rows))
 	for _, row := range rows {
 		rr, _ := row.([]any)
-		out = append(out, rr)
+		cells := make([]any, 0, len(rr))
+		for _, c := range rr {
+			// Turso cell: {"type":"text","value":"..."} → 解包裸值
+			if m, ok := c.(map[string]any); ok {
+				if v, has := m["value"]; has {
+					cells = append(cells, v)
+					continue
+				}
+			}
+			cells = append(cells, c)
+		}
+		out = append(out, cells)
 	}
 	return out
 }
@@ -253,6 +285,9 @@ func toFloat(v any) (float64, bool) {
 		return float64(n), true
 	case int:
 		return float64(n), true
+	case string:
+		f, err := strconv.ParseFloat(n, 64)
+		return f, err == nil
 	case json.Number:
 		f, err := n.Float64()
 		return f, err == nil
