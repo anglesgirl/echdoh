@@ -635,6 +635,28 @@ func SaveEchTestCache() {
 // 决定性证据：x.com 官方段 162.159.140.x ECH accepted → HTTP 200（1.5s），
 // 而同段 172.66.0.x ECH 握手挂起（echbrowser Firefox code=37 超时）——
 // 官方解析多段中部分段不响应 ECH。必须探测后只改写到 ECH 可用的段。
+// hasOwnECHConfig 查上游 HTTPS 记录：域名是否自带 ech= 配置。
+// 2026-08-16：javchu.com 等发布 CF 公共 ECH 的域名，probe 时 inner cert
+// 是 cloudflare-ech.com（不匹配域名）—— 但 Firefox 用域名自己发布的 ech=
+// 连接，接受该证书，必须算 forceable（否则 A 记录不改写 → 官方 IP 路由到
+// 远边缘，实测 javchu.com → AMS）。
+func hasOwnECHConfig(name string) bool {
+	q := new(dns.Msg)
+	q.SetQuestion(dns.Fqdn(name), dns.TypeHTTPS)
+	resp, err := queryUpstream(q)
+	if err != nil || resp == nil {
+		return false
+	}
+	for _, rr := range resp.Answer {
+		for _, kv := range svcbValues(rr) {
+			if _, isECH := kv.(*dns.SVCBECHConfig); isECH {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func echHandshakeOK(ip, host string, timeout time.Duration) bool {
 	cacheKey := host + "|" + ip
 	echTestMu.Lock()
@@ -919,6 +941,19 @@ func forcedHintIPsOpt(name string, official []string, max int, poolFirst bool) [
 	if len(poolOut) > 0 {
 		SaveEchTestCache()
 		src = "cloud-pool(ECH-cached)"
+	}
+
+	// poolFirst（非 forced 域名）：pool IP 先入 out（最前），official 补充在后面
+	if poolFirst && len(poolOut) > 0 {
+		for _, ip := range poolOut {
+			if !containsStr(out, ip) {
+				out = append(out, ip)
+			}
+			if len(out) >= max {
+				break
+			}
+		}
+		src = "cloud-pool(ECH-cached,first)"
 	}
 
 	if len(official) > 0 {

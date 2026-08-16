@@ -177,8 +177,15 @@ func probeDomain(name string) {
 	}
 	// 关键：ECH 握手验证的是外层 SNI（cloudflare-ech.com）的证书，
 	// 必须再验证内层——服务器证书链应对应目标域名，才说明 CF 有内容。
+	// 2026-08-16 例外：域名**自带 ech=**（javchu.com 实测发布 CF 公共 ECH，
+	// inner 证书就是 cloudflare-ech.com）—— Firefox 用域名自己发布的
+	// ech= 配置连接，接受该 inner 证书（ECH 配置即信任来源），无需匹配
+	// 域名。此时 ECH 握手 accepted 即 forceable。
 	forceable := false
-	if uc, ok := conn.(*utls.UConn); ok {
+	if hasOwnECHConfig(name) {
+		forceable = true
+		slog("probe: %s has own ech= config, ECH accepted -> mark forceable ✓", name)
+	} else if uc, ok := conn.(*utls.UConn); ok {
 		state := uc.ConnectionState()
 		if certs := state.PeerCertificates; len(certs) > 0 {
 			pool := x509.NewCertPool()
