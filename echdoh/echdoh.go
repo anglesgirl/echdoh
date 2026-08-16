@@ -126,10 +126,16 @@ func Start(listen string, certPEM, keyPEM, upstreams string) error {
 		listen = "127.0.0.1:8443"
 	}
 	upstream = nil
-	for _, u := range strings.Split(upstreams, ",") {
-		u = strings.TrimSpace(u)
-		if u != "" {
-			upstream = append(upstream, u)
+	// 2026-08-16：种子 TXT（ech-config.anglesgirl.eu.org doh=/doh2=/doh3=）
+	// 动态上游优先（7 个 CF gateway 轮换，远端可改）；失败用传入的兜底
+	if seed := fetchSeedUpstreams(); len(seed) > 0 {
+		upstream = seed
+	} else {
+		for _, u := range strings.Split(upstreams, ",") {
+			u = strings.TrimSpace(u)
+			if u != "" {
+				upstream = append(upstream, u)
+			}
 		}
 	}
 	if len(upstream) == 0 {
@@ -138,6 +144,7 @@ func Start(listen string, certPEM, keyPEM, upstreams string) error {
 			"https://162.159.36.5/dns-query",
 		}
 	}
+	slog("upstreams: %d endpoints", len(upstream))
 
 	// 后台扫描 CF IP 段找可达边缘（进轮换池，解决单一 IP 抖动）
 	StartScanCFIPs(64)
