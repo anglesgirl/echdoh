@@ -113,3 +113,53 @@ func fetchSeedUpstreams() []string {
 	slog("seed upstreams from TXT: %d endpoints (%s...)", len(ups), ups[0])
 	return ups
 }
+
+// ---- R2 配置远程化（2026-08-16）----
+// R2 凭证可公开：桶里是 AES-256-GCM 加密的证书包（32 位密码才打得开），
+// 别人拿到凭证也只能下载加密数据。真正的机密 = 加密密码（内置 APK）。
+// TXT 字段：r2_endpoint= / r2_bucket= / r2_key= / r2_secret= / r2_cert_obj=
+
+type R2Config struct {
+	Endpoint  string
+	Bucket    string
+	AccessKey string
+	SecretKey string
+	CertObj   string
+}
+
+// FetchR2Config 从种子 TXT 拉 R2 配置（客户端启动调用，替代硬编码）。
+// 返回空结构体 = 种子不可用或无配置（调用方用内置兜底）。
+func FetchR2Config() R2Config {
+	fields := fetchSeedTXT()
+	if fields == nil {
+		return R2Config{}
+	}
+	cfg := R2Config{
+		Endpoint:  fields["r2_endpoint"],
+		Bucket:    fields["r2_bucket"],
+		AccessKey: fields["r2_key"],
+		SecretKey: fields["r2_secret"],
+		CertObj:   fields["r2_cert_obj"],
+	}
+	if cfg.Endpoint == "" || cfg.Bucket == "" || cfg.AccessKey == "" || cfg.SecretKey == "" {
+		slog("R2 config from seed incomplete (endpoint=%s bucket=%s key=%s)",
+			cfg.Endpoint, cfg.Bucket, cfg.AccessKey)
+		return R2Config{}
+	}
+	if cfg.CertObj == "" {
+		cfg.CertObj = "echdoh-cert.b64"
+	}
+	slog("R2 config from seed TXT: bucket=%s obj=%s", cfg.Bucket, cfg.CertObj)
+	return cfg
+}
+
+// FetchCertFromR2Auto 无参版：R2 配置从种子 TXT 拉，密码由调用方传。
+// 成功返回 "certPEM\n===KEY===\nkeyPEM"，失败返回 ""。
+func FetchCertFromR2Auto(passphrase string) string {
+	cfg := FetchR2Config()
+	if cfg.Endpoint == "" {
+		return ""
+	}
+	return FetchCertFromR2(cfg.Endpoint, cfg.Bucket, cfg.CertObj,
+		cfg.AccessKey, cfg.SecretKey, passphrase)
+}
