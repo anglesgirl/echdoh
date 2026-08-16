@@ -161,6 +161,11 @@ func Start(listen string, certPEM, keyPEM, upstreams string) error {
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/dns-query", handleDoH)
+	// 管理后台（2026-08-16）：本机浏览器打开 https://doh.anglesgirl.eu.org:8443/admin
+	mux.HandleFunc("/admin", handleAdmin)
+	mux.HandleFunc("/admin/api/status", handleAdminStatus)
+	mux.HandleFunc("/admin/api/logs", handleAdminLogs)
+	mux.HandleFunc("/admin/api/refresh", handleAdminRefresh)
 
 	// 用 PEM 内容直接构造 TLS 证书（ListenAndServeTLS 只接受文件路径，
 	// gomobile 场景拿不到文件系统路径，必须 X509KeyPair 加载内容）。
@@ -235,6 +240,7 @@ func LastError() string {
 }
 
 func handleDoH(w http.ResponseWriter, r *http.Request) {
+	queryCount++
 	var raw []byte
 	if r.Method == http.MethodGet {
 		b64 := r.URL.Query().Get("dns")
@@ -410,16 +416,19 @@ func queryUpstream(req *dns.Msg) (*dns.Msg, error) {
 		resp, err := client.Get(full)
 		if err != nil {
 			lastErr = err
+			lastUpstreamErr = fmt.Sprintf("%s %s: %v", time.Now().Format("15:04:05"), u, err)
 			continue
 		}
 		body, err := io.ReadAll(io.LimitReader(resp.Body, 65535))
 		resp.Body.Close()
 		if err != nil {
 			lastErr = err
+			lastUpstreamErr = fmt.Sprintf("%s %s: %v", time.Now().Format("15:04:05"), u, err)
 			continue
 		}
 		if resp.StatusCode != 200 {
 			lastErr = fmt.Errorf("upstream HTTP %d", resp.StatusCode)
+			lastUpstreamErr = fmt.Sprintf("%s %s: HTTP %d", time.Now().Format("15:04:05"), u, resp.StatusCode)
 			continue
 		}
 		out := new(dns.Msg)
