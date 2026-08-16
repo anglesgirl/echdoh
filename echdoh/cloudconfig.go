@@ -164,6 +164,7 @@ func fetchCloudConfigTXT() {
 		}
 		SetOverride(b.String())
 		slog("cloud config: overrides applied (%d)", len(cfg.Overrides))
+		respCacheClear() // override 变更 → 旧解析缓存失效
 	}
 	slog("cloud config: force=%v pool=%v rewrite=%v", cfg.ForceCF, cfg.Pool, cfg.Rewrite)
 }

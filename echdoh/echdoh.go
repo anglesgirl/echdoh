@@ -159,6 +159,10 @@ func Start(listen string, certPEM, keyPEM, upstreams string) error {
 	// （2026-08-15 用户要求：改 IP 改 DNS 记录即可，零出包）
 	StartCloudConfig()
 
+	// 2026-08-16 预热：后台解析常用域名，填充解析缓存 + 探测缓存
+	// （用户访问时秒回，治"等半天"）。域名 = override 名单 + x.com 全家桶。
+	go warmUpCache()
+
 	mux := http.NewServeMux()
 	mux.HandleFunc("/dns-query", handleDoH)
 	// 管理后台（2026-08-16）：本机浏览器打开 https://doh.anglesgirl.eu.org:8443/admin
@@ -278,6 +282,17 @@ func handleDoH(w http.ResponseWriter, r *http.Request) {
 	}
 	q := req.Question[0]
 
+	// 2026-08-16 解析结果缓存：命中直接返回（免上游，治"等半天"）。
+	// 只缓存安全类型（A/AAAA/HTTPS），缓存键含 qtype。
+	cacheKey := respCacheKey(q.Name, q.Qtype)
+	if q.Qtype == dns.TypeA || q.Qtype == dns.TypeAAAA || q.Qtype == dns.TypeHTTPS {
+		if cached := respCacheGet(cacheKey); cached != nil {
+			w.Header().Set("Content-Type", "application/dns-message")
+			w.Write(cached)
+			return
+		}
+	}
+
 	resp, err := queryUpstream(req)
 	if err != nil {
 		slog("upstream error for %s %s: %v", q.Name, dns.TypeToString[q.Qtype], err)
@@ -329,7 +344,7 @@ func handleDoH(w http.ResponseWriter, r *http.Request) {
 			injectECHWithHints(resp, q.Name, strings.Split(ip, ","))
 			slog("%s: OVERRIDE HTTPS -> ech= + hint=%s", q.Name, ip)
 		}
-		writeResponse(w, resp)
+		writeResponse(w, resp, cacheKey)
 		return
 	}
 
@@ -352,7 +367,7 @@ func handleDoH(w http.ResponseWriter, r *http.Request) {
 		// trr.mode=3 无 Do53 回退 → loadError code=37。日志里
 		// "x.com A -> 6 answers (forced-CF)" 只是内存里的答案，没发出去。
 		// dohbench 实测：客户端收到 "overflow unpacking uint16"（空响应）。
-		writeResponse(w, resp)
+		writeResponse(w, resp, cacheKey)
 		return
 	}
 
@@ -375,17 +390,21 @@ func handleDoH(w http.ResponseWriter, r *http.Request) {
 	slog("%s %s -> %d answers (%s)", q.Name, dns.TypeToString[q.Qtype],
 		len(resp.Answer), summarizeECH(resp))
 
-	writeResponse(w, resp)
+	writeResponse(w, resp, cacheKey)
 }
 
 // writeResponse 打包并写出 DNS 响应。所有出口必须走这里 —— 2026-08-15
 // 的 code=37 根因就是 forced-CF 分支绕过了写响应的代码直接 return。
-func writeResponse(w http.ResponseWriter, resp *dns.Msg) {
+func writeResponse(w http.ResponseWriter, resp *dns.Msg, cacheKey string) {
 	out, err := resp.Pack()
 	if err != nil {
 		slog("pack failed: %v", err)
 		http.Error(w, "pack failed", http.StatusInternalServerError)
 		return
+	}
+	// 2026-08-16：写解析缓存（A/AAAA/HTTPS 最终响应，含强注强改结果）
+	if cacheKey != "" {
+		respCachePut(cacheKey, out)
 	}
 	w.Header().Set("Content-Type", "application/dns-message")
 	w.Header().Set("Cache-Control", "max-age=60")
