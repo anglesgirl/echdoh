@@ -67,7 +67,24 @@ func processResponse(resp *dns.Msg, name string) {
 			}
 			resp.Answer = ans
 		case dns.TypeAAAA:
-			resp.Answer = nil
+			if v6s, ok := matchOverrideV6(q.Name); ok && len(v6s) > 0 {
+				var ans []dns.RR
+				seen := map[string]bool{}
+				for _, s := range v6s {
+					p := net.ParseIP(s)
+					if p == nil || seen[s] {
+						continue
+					}
+					seen[s] = true
+					ans = append(ans, &dns.AAAA{
+						Hdr:  dns.RR_Header{Name: q.Name, Rrtype: dns.TypeAAAA, Class: dns.ClassINET, Ttl: 300},
+						AAAA: p,
+					})
+				}
+				resp.Answer = ans
+			} else {
+				resp.Answer = nil
+			}
 		case dns.TypeHTTPS:
 			injectECHWithHints(resp, q.Name, strings.Split(ip, ","))
 		}

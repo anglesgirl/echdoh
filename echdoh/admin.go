@@ -83,8 +83,59 @@ type AdminStatus struct {
 }
 
 func handleAdmin(w http.ResponseWriter, r *http.Request) {
+	// 2026-08-16 v2：服务端渲染（不依赖 fetch —— 手机 Firefox fetch 到本地
+	// 服务失败 NetworkError，导航加载正常）。状态/云配置/日志直接拼进 HTML。
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	fmt.Fprint(w, adminHTML)
+
+	mu.Lock()
+	upErr := lastUpstreamErr
+	qc := queryCount
+	la := listenAddr
+	sa := startedAt.Format("2006-01-02 15:04:05")
+	mu.Unlock()
+
+	cloudMu.Lock()
+	pool := strings.Join(cloudPoolIPs(), ", ")
+	ov := cloudOverridesStr()
+	force := "(内置名单)"
+	if len(cloudCfg.ForceCF) > 0 {
+		force = strings.Join(cloudCfg.ForceCF, ", ")
+	}
+	cloudMu.Unlock()
+
+	logs := PollLogs()
+	if logs == "" {
+		logs = "(Go 日志缓冲空 —— 刚启动或查询未发生)"
+	}
+
+	fmt.Fprintf(w, `<!DOCTYPE html><html><head><meta charset="utf-8">
+<title>echdoh 管理后台</title>
+<style>body{font-family:monospace;background:#0d1117;color:#c9d1d9;padding:16px;max-width:800px;margin:auto}
+h1{font-size:18px}h2{font-size:14px;color:#58a6ff;margin-top:20px}
+table{border-collapse:collapse;width:100%%}th{text-align:left;color:#8b949e;font-weight:normal;width:130px;padding:4px 8px;vertical-align:top}
+td{padding:4px 8px;word-break:break-all}.ok{color:#3fb950}.err{color:#f85149}
+pre{background:#161b22;padding:10px;border-radius:6px;font-size:11px;max-height:500px;overflow-y:auto}
+a{color:#58a6ff}</style></head><body>
+<h1>echdoh 管理后台 <a href="/admin">↻</a></h1>
+<table><tr><th>监听</th><td>%s</td></tr>
+<tr><th>运行</th><td class="ok">运行中</td></tr>
+<tr><th>启动</th><td>%s</td></tr>
+<tr><th>DNS 查询</th><td>%d</td></tr>
+<tr><th>上游错误</th><td>%s</td></tr></table>
+<h2>云配置</h2>
+<table><tr><th>pool</th><td>%s</td></tr>
+<tr><th>overrides</th><td>%s</td></tr>
+<tr><th>force</th><td>%s</td></tr></table>
+<h2>工作日志</h2>
+<pre>%s</pre>
+</body></html>`, la, sa, qc, upErr, pool, ov, force, htmlEscape(logs))
+}
+
+func htmlEscape(s string) string {
+	s = strings.ReplaceAll(s, "&", "&amp;")
+	s = strings.ReplaceAll(s, "<", "&lt;")
+	s = strings.ReplaceAll(s, ">", "&gt;")
+	return s
 }
 
 func handleAdminStatus(w http.ResponseWriter, r *http.Request) {

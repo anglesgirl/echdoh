@@ -66,6 +66,60 @@ func SetOverride(s string) {
 	slog("override set: %d rule(s)", len(overrideMap))
 }
 
+// ---- override v6（2026-08-16）----
+// override 只改 A（IPv4），AAAA 一律清空 —— 但配了 IPv4 专用 IP 的域名
+// （如 google.com=阿里云专用 IP）仍需要真实 IPv6 双通道（用户：没 IPv6
+// 谷歌就不正常）。TXT 字段：v6_overrides=host=ipv6,ipv6;host=ipv6
+var overrideV6Mu sync.Mutex
+
+var overrideV6Map = map[string][]string{}
+
+// SetOverrideV6 设置 IPv6 override 规则（host=ipv6,ipv6;...）。
+func SetOverrideV6(spec string) {
+	overrideV6Mu.Lock()
+	defer overrideV6Mu.Unlock()
+	overrideV6Map = map[string][]string{}
+	for _, rule := range strings.Split(spec, ";") {
+		rule = strings.TrimSpace(rule)
+		if rule == "" {
+			continue
+		}
+		parts := strings.SplitN(rule, "=", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		host := strings.ToLower(strings.TrimSuffix(strings.TrimSpace(parts[0]), "."))
+		var v6s []string
+		for _, v := range strings.Split(parts[1], ",") {
+			v = strings.TrimSpace(v)
+			if net.ParseIP(v) != nil && strings.Contains(v, ":") {
+				v6s = append(v6s, v)
+			}
+		}
+		if len(v6s) > 0 {
+			overrideV6Map[host] = v6s
+		}
+	}
+	slog("override v6 set: %d rule(s)", len(overrideV6Map))
+}
+
+// matchOverrideV6 返回域名匹配的 IPv6 列表。
+func matchOverrideV6(name string) ([]string, bool) {
+	name = strings.ToLower(strings.TrimSuffix(dns.Fqdn(name), "."))
+	overrideV6Mu.Lock()
+	defer overrideV6Mu.Unlock()
+	if v6s, ok := overrideV6Map[name]; ok {
+		return v6s, true
+	}
+	// 子域匹配（www.google.com → google.com 规则）
+	for host, v6s := range overrideV6Map {
+		if strings.HasSuffix(name, "."+host) {
+			return v6s, true
+		}
+	}
+	return nil, false
+}
+
 // matchOverride 精确或子域匹配（x.com 规则同时覆盖 api.x.com / abs.twimg.com 等）。
 func matchOverride(name string) (string, bool) {
 	name = strings.ToLower(strings.TrimSuffix(name, "."))
@@ -301,6 +355,31 @@ func handleDoH(w http.ResponseWriter, r *http.Request) {
 	}
 	resp.Id = req.Id
 
+	// v6 override（2026-08-16，独立于 v4 override）：AAAA 查询命中
+	// v6_overrides 直接返回指定 IPv6（如 google.com 双通道：A=专用 IP +
+	// AAAA=真实 IPv6）。必须在 override 分支之前检查。
+	if q.Qtype == dns.TypeAAAA {
+		if v6s, ok := matchOverrideV6(q.Name); ok && len(v6s) > 0 {
+			var ans []dns.RR
+			seen := map[string]bool{}
+			for _, s := range v6s {
+				p := net.ParseIP(s)
+				if p == nil || seen[s] {
+					continue
+				}
+				seen[s] = true
+				ans = append(ans, &dns.AAAA{
+					Hdr:  dns.RR_Header{Name: q.Name, Rrtype: dns.TypeAAAA, Class: dns.ClassINET, Ttl: 300},
+					AAAA: p,
+				})
+			}
+			resp.Answer = ans
+			slog("%s: V6OVERRIDE AAAA -> %v", q.Name, v6s)
+			writeResponse(w, resp, cacheKey)
+			return
+		}
+	}
+
 	// 手动 IP 覆盖（最高优先，2026-08-15）：用户指定的 域名=IP 直接返回。
 	// A 记录返回指定 IP；HTTPS 查询同样注入 ech= + ipv4hint=指定 IP ——
 	// 2026-08-15 实测修复：旧代码只处理 A/AAAA，HTTPS 落到 forced-CF 分支
@@ -336,8 +415,28 @@ func handleDoH(w http.ResponseWriter, r *http.Request) {
 				slog("%s: OVERRIDE A -> %v", q.Name, ips)
 			}
 		case dns.TypeAAAA:
-			resp.Answer = nil
-			slog("%s: OVERRIDE AAAA -> empty", q.Name)
+			// 2026-08-16：v6 override 优先（真实 IPv6 双通道，如 google.com）；
+			// 未配 v6 才清空（强制 IPv4）
+			if v6s, ok := matchOverrideV6(q.Name); ok && len(v6s) > 0 {
+				var ans []dns.RR
+				seen := map[string]bool{}
+				for _, s := range v6s {
+					p := net.ParseIP(s)
+					if p == nil || seen[s] {
+						continue
+					}
+					seen[s] = true
+					ans = append(ans, &dns.AAAA{
+						Hdr:  dns.RR_Header{Name: q.Name, Rrtype: dns.TypeAAAA, Class: dns.ClassINET, Ttl: 300},
+						AAAA: p,
+					})
+				}
+				resp.Answer = ans
+				slog("%s: OVERRIDE AAAA -> %v", q.Name, v6s)
+			} else {
+				resp.Answer = nil
+				slog("%s: OVERRIDE AAAA -> empty", q.Name)
+			}
 		case dns.TypeHTTPS:
 			// 注入 ech= + ipv4hint=override IP 列表：A 与 HTTPS 指向同一批 IP，
 			// Firefox 走 ECH 隐藏 SNI（见 injectECHWithHints）。

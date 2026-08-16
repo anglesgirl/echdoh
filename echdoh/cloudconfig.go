@@ -166,6 +166,12 @@ func fetchCloudConfigTXT() {
 		slog("cloud config: overrides applied (%d)", len(cfg.Overrides))
 		respCacheClear() // override 变更 → 旧解析缓存失效
 	}
+	// 2026-08-16：v6_overrides=host=ipv6;...（真实 IPv6 双通道）
+	if v := fields["v6_overrides"]; v != "" {
+		SetOverrideV6(v)
+		slog("cloud config: v6 overrides applied")
+		respCacheClear()
+	}
 	slog("cloud config: force=%v pool=%v rewrite=%v", cfg.ForceCF, cfg.Pool, cfg.Rewrite)
 }
 
