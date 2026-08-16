@@ -838,6 +838,15 @@ const forcedHintTTL = 5 * time.Minute
 // 单飞保护：Firefox 会几乎同时发 A / AAAA / HTTPS 三个查询，若各自独立
 // 探测会重复几十次 TLS 握手（旧日志里同一秒重复三遍 ECH probe 即此因）。
 func forcedHintIPs(name string, official []string, max int) []string {
+	return forcedHintIPsOpt(name, official, max, false)
+}
+
+// forcedHintIPsOpt：poolFirst=true 时 pool IP（ECH 验证过的）排最前。
+// 2026-08-16：非 forced 域名（rewriteAIfCF 路径）pool 优先 —— 用户实测
+// javchu.com 官方段 IP 路由到 AMS（欧洲，~200ms），而 pool 钦定 IP
+// （172.64.146.66/104.18.41.190）实测路由 NRT（东京）快；forced 名单
+// （x.com）保持官方段优先（2026-08-15 教训：pool 排第 1 时 0x93 失败）。
+func forcedHintIPsOpt(name string, official []string, max int, poolFirst bool) []string {
 	key := strings.TrimSuffix(strings.ToLower(dns.Fqdn(name)), ".")
 
 	for {
@@ -943,6 +952,19 @@ func forcedHintIPs(name string, official []string, max int) []string {
 				}
 			}
 		}
+	}
+	// 2026-08-16：非 forced 域名 pool 优先（poolFirst）—— 官方段 IP 可能
+	// 路由到远边缘（javchu.com→AMS 实测），pool 钦定 IP 实测路由 NRT 快。
+	if poolFirst && len(poolOut) > 0 {
+		for _, ip := range poolOut {
+			if !containsStr(out, ip) {
+				out = append(out, ip)
+			}
+			if len(out) >= max {
+				break
+			}
+		}
+		src = "cloud-pool(ECH-cached,first)"
 	}
 	// 最后补 pool 备胎（不占已验证 IP 的位置）
 	if len(out) < max {
@@ -1241,7 +1263,7 @@ func rewriteAIfCF(resp *dns.Msg, name string) {
 	// forcedHintIPs 同时带来 fail-closed 语义：ECH 探测全失败 → 返回空 →
 	// 这里保持原样不改写（本函数只在 AllAS13335 为真时才走到，域名确实在
 	// CF 上，与 abs-0.twimg.com 那类不同，保留原始解析不会泄漏到墙外 CDN）。
-	hintIPs := forcedHintIPs(name, ips, 6)
+	hintIPs := forcedHintIPsOpt(name, ips, 6, true) // 非 forced：pool 优先（NRT 快）
 	if len(hintIPs) == 0 {
 		slog("%s: ECH probe failed on all candidates, keep original A=%v", name, ips)
 		return
