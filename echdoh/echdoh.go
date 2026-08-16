@@ -180,16 +180,11 @@ func Start(listen string, certPEM, keyPEM, upstreams string) error {
 		listen = "127.0.0.1:8443"
 	}
 	upstream = nil
-	// 2026-08-16：种子 TXT（ech-config.anglesgirl.eu.org doh=/doh2=/doh3=）
-	// 动态上游优先（7 个 CF gateway 轮换，远端可改）；失败用传入的兜底
-	if seed := fetchSeedUpstreams(); len(seed) > 0 {
-		upstream = seed
-	} else {
-		for _, u := range strings.Split(upstreams, ",") {
-			u = strings.TrimSpace(u)
-			if u != "" {
-				upstream = append(upstream, u)
-			}
+	// 兜底上游立即可用（种子/云配置后台加载后替换，2026-08-16：启动不阻塞）
+	for _, u := range strings.Split(upstreams, ",") {
+		u = strings.TrimSpace(u)
+		if u != "" {
+			upstream = append(upstream, u)
 		}
 	}
 	if len(upstream) == 0 {
@@ -198,10 +193,24 @@ func Start(listen string, certPEM, keyPEM, upstreams string) error {
 			"https://162.159.36.5/dns-query",
 		}
 	}
-	slog("upstreams: %d endpoints", len(upstream))
+	slog("upstreams: %d endpoints (fallback, seed 后台加载)", len(upstream))
+
+	// 2026-08-16：种子 TXT 上游 + 云配置 + IP 扫描全部异步 —— DoH 立即
+	// 就绪（用户实测启动等很久，根因是同步拉取阻塞 Start）。
+	// 种子：成功则替换 upstream（queryUpstream 已加锁复制）
+	go func() {
+		if seed := fetchSeedUpstreams(); len(seed) > 0 {
+			mu.Lock()
+			upstream = seed
+			mu.Unlock()
+			slog("upstreams: seed %d endpoints", len(seed))
+		} else {
+			slog("seed TXT unavailable, keep fallback")
+		}
+	}()
 
 	// 后台扫描 CF IP 段找可达边缘（进轮换池，解决单一 IP 抖动）
-	StartScanCFIPs(64)
+	go StartScanCFIPs(64)
 
 	// 云缓存：启动拉一次云端探测结果合并（SetCloudCache 启用时）
 	go func() {
@@ -211,7 +220,7 @@ func Start(listen string, certPEM, keyPEM, upstreams string) error {
 
 	// 云配置：从 doh.anglesgirl.eu.org TXT 拉取 overrides/force/pool
 	// （2026-08-15 用户要求：改 IP 改 DNS 记录即可，零出包）
-	StartCloudConfig()
+	go StartCloudConfig()
 
 	// 2026-08-16 预热：后台解析常用域名，填充解析缓存 + 探测缓存
 	// （用户访问时秒回，治"等半天"）。域名 = override 名单 + x.com 全家桶。
@@ -525,7 +534,10 @@ func queryUpstream(req *dns.Msg) (*dns.Msg, error) {
 		},
 	}
 	var lastErr error
-	for _, u := range upstream {
+	mu.Lock()
+	up := append([]string{}, upstream...)
+	mu.Unlock()
+	for _, u := range up {
 		sep := "?"
 		if strings.Contains(u, "?") {
 			sep = "&"
