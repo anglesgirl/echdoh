@@ -154,6 +154,60 @@ func sigv4GetForTest(endpoint, accessKey, secretKey, bucket, objectKey string) (
 	return sigv4Get(endpoint, accessKey, secretKey, bucket, objectKey, time.Now())
 }
 
+// ---- R2 上传（崩溃日志自动上报用，2026-08-16）----
+
+func sigv4Put(endpoint, accessKey, secretKey, bucket, objectKey string, body []byte, contentType string) error {
+	t := time.Now().UTC()
+	amzDate := t.Format("20060102T150405Z")
+	dateStamp := t.Format("20060102")
+	region, service := "auto", "s3"
+	host := strings.TrimPrefix(strings.TrimPrefix(endpoint, "https://"), "http://")
+	canonicalURI := "/" + bucket + "/" + objectKey
+	payloadHash := sha256Hex(body)
+	canonicalHeaders := fmt.Sprintf("content-type:%s\nhost:%s\nx-amz-content-sha256:%s\nx-amz-date:%s\n",
+		contentType, host, payloadHash, amzDate)
+	signedHeaders := "content-type;host;x-amz-content-sha256;x-amz-date"
+	canonicalRequest := strings.Join([]string{"PUT", canonicalURI, "", canonicalHeaders, signedHeaders, payloadHash}, "\n")
+	scope := fmt.Sprintf("%s/%s/%s/aws4_request", dateStamp, region, service)
+	stringToSign := strings.Join([]string{"AWS4-HMAC-SHA256", amzDate, scope, sha256Hex([]byte(canonicalRequest))}, "\n")
+	kDate := hmacSHA256([]byte("AWS4"+secretKey), []byte(dateStamp))
+	kRegion := hmacSHA256(kDate, []byte(region))
+	kService := hmacSHA256(kRegion, []byte(service))
+	kSigning := hmacSHA256(kService, []byte("aws4_request"))
+	signature := hex.EncodeToString(hmacSHA256(kSigning, []byte(stringToSign)))
+
+	req, err := http.NewRequest(http.MethodPut, endpoint+canonicalURI, bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", contentType)
+	req.Header.Set("X-Amz-Date", amzDate)
+	req.Header.Set("X-Amz-Content-Sha256", payloadHash)
+	req.Header.Set("Authorization", fmt.Sprintf(
+		"AWS4-HMAC-SHA256 Credential=%s/%s, SignedHeaders=%s, Signature=%s",
+		accessKey, scope, signedHeaders, signature))
+	client := &http.Client{Timeout: 30 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		return fmt.Errorf("R2 PUT HTTP %d: %s", resp.StatusCode, string(b))
+	}
+	return nil
+}
+
+// UploadToR2 上传内容到 R2 私有桶（崩溃日志自动上报）。成功返回 true。
+func UploadToR2(endpoint, bucket, objectKey, accessKey, secretKey, contentType, content string) bool {
+	if err := sigv4Put(endpoint, accessKey, secretKey, bucket, objectKey, []byte(content), contentType); err != nil {
+		slog("UploadToR2 failed: %v", err)
+		return false
+	}
+	return true
+}
+
 var _ = json.Marshal // 保持 import
 var _ = bytes.MinRead
 var _ = url.QueryEscape
