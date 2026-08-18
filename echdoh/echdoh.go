@@ -159,24 +159,43 @@ func PollLogs() string {
 	return out
 }
 
-// FlushLogsToR2 增量拉取 Go 侧日志并上传到 R2（Kotlin 定时调用）。
-// R2 配置从种子 TXT 拉取（公开可读），objectKey 含 UTC 时间戳避免覆盖。
+// FlushLogsToR2 增量读取 Go 侧日志并上传到 R2（Kotlin 定时调用）。
+// 重要：上传成功前绝不推进 logPos；网络、种子或 R2 失败时日志会保留，
+// 下一个周期自动重试，避免原实现 PollLogs() 先消费导致日志永久丢失。
 func FlushLogsToR2() int {
-	logs := PollLogs()
-	if logs == "" {
-		return 0
-	}
+	// 先取配置。FetchR2Config 失败时不触碰日志缓冲。
 	cfg := FetchR2Config()
 	if cfg.Endpoint == "" {
+		slog("LOG_UPLOAD_SKIP reason=r2_config_unavailable")
 		return 0
 	}
-	ts := time.Now().UTC().Format("20060102-150405")
-	obj := "logs/echdoh-" + ts + ".txt"
-	content := "=== echdoh log " + ts + " ===\n" + logs
-	if UploadToR2(cfg.Endpoint, cfg.Bucket, obj, cfg.AccessKey, cfg.SecretKey, "text/plain", content) {
-		return len(content)
+
+	// 只读快照，不推进 logPos；允许 Go 日志继续追加。
+	logBufMu.Lock()
+	start := logPos
+	if start >= len(logBuf) {
+		logBufMu.Unlock()
+		return 0
 	}
-	return 0
+	pending := append([]string(nil), logBuf[start:]...)
+	logBufMu.Unlock()
+
+	ts := time.Now().UTC().Format("20060102-150405.000")
+	obj := "logs/echdoh-" + strings.ReplaceAll(ts, ".", "-") + ".txt"
+	content := "=== echdoh log " + ts + " ===\n" + strings.Join(pending, "\n") + "\n"
+	if !UploadToR2(cfg.Endpoint, cfg.Bucket, obj, cfg.AccessKey, cfg.SecretKey, "text/plain", content) {
+		slog("LOG_UPLOAD_FAIL object=%s bytes=%d pending=%d", obj, len(content), len(pending))
+		return 0
+	}
+
+	// 只有成功后才提交本次快照。追加期间产生的新日志不会被跳过。
+	logBufMu.Lock()
+	if logPos < start+len(pending) {
+		logPos = start + len(pending)
+	}
+	logBufMu.Unlock()
+	slog("LOG_UPLOAD_OK object=%s bytes=%d lines=%d", obj, len(content), len(pending))
+	return len(content)
 }
 
 // slog 带缓冲的日志：既写 stderr（logcat），也进缓冲供 Kotlin 拉取。
