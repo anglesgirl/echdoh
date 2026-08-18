@@ -159,12 +159,33 @@ func PollLogs() string {
 	return out
 }
 
+// FlushLogsToR2 增量拉取 Go 侧日志并上传到 R2（Kotlin 定时调用）。
+// R2 配置从种子 TXT 拉取（公开可读），objectKey 含 UTC 时间戳避免覆盖。
+func FlushLogsToR2() int {
+	logs := PollLogs()
+	if logs == "" {
+		return 0
+	}
+	cfg := FetchR2Config()
+	if cfg.Endpoint == "" {
+		return 0
+	}
+	ts := time.Now().UTC().Format("20060102-150405")
+	obj := "logs/echdoh-" + ts + ".txt"
+	content := "=== echdoh log " + ts + " ===\n" + logs
+	if UploadToR2(cfg.Endpoint, cfg.Bucket, obj, cfg.AccessKey, cfg.SecretKey, "text/plain", content) {
+		return len(content)
+	}
+	return 0
+}
+
 // slog 带缓冲的日志：既写 stderr（logcat），也进缓冲供 Kotlin 拉取。
 func slog(format string, args ...interface{}) {
+	ts := time.Now().Format("2006-01-02 15:04:05")
 	msg := fmt.Sprintf(format, args...)
-	log.Printf("[doh] %s", msg)
+	log.Printf("[doh] %s %s", ts, msg)
 	logBufMu.Lock()
-	logBuf = append(logBuf, msg)
+	logBuf = append(logBuf, ts+" "+msg)
 	logBufMu.Unlock()
 }
 
@@ -356,12 +377,25 @@ func handleDoH(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// 2026-08-18：详细查询日志（供甲骨文管道分析）。
+	t0 := time.Now()
 	resp, err := queryUpstream(req)
+	elapsed := time.Since(t0)
 	if err != nil {
-		slog("upstream error for %s %s: %v", q.Name, dns.TypeToString[q.Qtype], err)
+		slog("QUERY FAIL %s %s upstream_err=%v (%dms)", q.Name, dns.TypeToString[q.Qtype], err, elapsed.Milliseconds())
 		writeError(w, req, dns.RcodeServerFailure)
 		return
 	}
+	var ips []string
+	for _, a := range resp.Answer {
+		switch v := a.(type) {
+		case *dns.A:
+			ips = append(ips, v.A.String())
+		case *dns.AAAA:
+			ips = append(ips, v.AAAA.String())
+		}
+	}
+	slog("QUERY %s %s -> %v (%dms) ups=%d", q.Name, dns.TypeToString[q.Qtype], ips, elapsed.Milliseconds(), len(upstream))
 	resp.Id = req.Id
 
 	// v6 override（2026-08-16，独立于 v4 override）：AAAA 查询命中
