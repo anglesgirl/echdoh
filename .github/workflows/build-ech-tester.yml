@@ -1,0 +1,30 @@
+name: build-ech-tester
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'cmd/ech-tester/**'
+      - 'internal/dns/**'
+      - 'internal/tlsconn/**'
+      - 'internal/certutil/**'
+      - 'go.mod'
+      - 'go.sum'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+      - name: Test ECH tester compiles
+        run: go test ./cmd/ech-tester
+      - name: Build Linux arm64 binary
+        run: GOOS=linux GOARCH=arm64 go build -trimpath -ldflags='-s -w' -o ech-tester-linux-arm64 ./cmd/ech-tester
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ech-tester-linux-arm64
+          path: ech-tester-linux-arm64
+          retention-days: 14
