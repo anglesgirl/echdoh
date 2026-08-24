@@ -26,7 +26,6 @@ func main() {
 	echB64 := flag.String("ech", "", "base64 ECHConfigList; empty fetches via DoH")
 	ip := flag.String("ip", "", "optional IPv4 or IPv6 target address")
 	timeout := flag.Duration("timeout", 12*time.Second, "per-address timeout")
-	skipVerify := flag.Bool("skip-verify", false, "diagnostic only: skip certificate validation while still requiring ECH acceptance")
 	flag.Parse()
 
 	name := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(*host)), ".")
@@ -70,8 +69,7 @@ func main() {
 		name, joinIPs(result.IPs), result.OuterSNI, source, len(result.ECH.Config))
 
 	// fallbackPlain=false is essential: successful plain TLS is a test failure.
-	// skipVerify exists only to reveal ECH rejection diagnostics, never as success criteria.
-	conn, err := tlsconn.New(*timeout, *skipVerify, false).DialECH(name, result)
+	conn, err := tlsconn.New(*timeout, false, false).DialECH(name, result)
 	if err != nil {
 		fatalf("ECH handshake failed: %v", err)
 	}
